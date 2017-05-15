@@ -28,6 +28,7 @@ instance profile used by the autoscaling group's launch configuration:
 * ec2:DescribeInstances
 * autoscaling:DescribeAutoScalingGroups
 * autoscaling:DescribeLifecycleHooks
+* autoscaling:CompleteLifecycleAction
 * sqs:DeleteMessage
 * sqs:GetQueueUrl
 * sqs:ReceiveMessage
