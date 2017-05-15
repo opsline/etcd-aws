@@ -55,6 +55,10 @@ type etcdMember struct {
 	ClientURLs []string `json:"clientURLs,omitempty"`
 }
 
+type etcdHealth struct {
+	Health string `json:"health"`
+}
+
 var localInstance *ec2.Instance
 var peerProtocol string
 var clientProtocol string
@@ -140,8 +144,14 @@ func getApiResponseWithBody(privateIpAddress string, instanceId string, path str
 	var req *http.Request
 
 	if bodyType == "" {
-		req, _ = http.NewRequest(method, fmt.Sprintf("%s://%s:%s/v2/%s",
-			clientProtocol, privateIpAddress, *etcdClientPort, path), body)
+		// health is an unversioned endpoint
+		if path == "health" {
+			req, _ = http.NewRequest(method, fmt.Sprintf("%s://%s:%s/%s",
+				clientProtocol, privateIpAddress, *etcdClientPort, path), body)
+		} else {
+			req, _ = http.NewRequest(method, fmt.Sprintf("%s://%s:%s/v2/%s",
+				clientProtocol, privateIpAddress, *etcdClientPort, path), body)
+		}
 	}
 
 	client, err := getHttpClient()
