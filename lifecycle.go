@@ -110,7 +110,7 @@ func handleLifecycleEvent(m *ec2cluster.LifecycleMessage) (shouldContinue bool, 
 				continue
 			}
 
-			if resp.StatusCode == 200 {
+			if resp.StatusCode == http.StatusOK {
 				break
 			}
 
