@@ -59,6 +59,7 @@ type etcdHealth struct {
 	Health string `json:"health"`
 }
 
+var awsSession *session.Session
 var localInstance *ec2.Instance
 var peerProtocol string
 var clientProtocol string
@@ -359,7 +360,7 @@ func main() {
 		}
 	}
 
-	awsSession := session.New()
+	awsSession = session.New()
 	if region := os.Getenv("AWS_REGION"); region != "" {
 		awsSession.Config.WithRegion(region)
 	}
