@@ -84,11 +84,18 @@ func getHttpClient() (*http.Client, error) {
 			RootCAs:      caCertPool,
 		}
 		tlsConfig.BuildNameToCertificate()
-		transport = &http.Transport{TLSClientConfig: tlsConfig}
+		transport = &http.Transport{
+			TLSClientConfig:     tlsConfig,
+			TLSHandshakeTimeout: 2 * time.Second,
+		}
 	} else {
 		transport = &http.Transport{}
 	}
-	client := &http.Client{Transport: transport}
+
+	transport.IdleConnTimeout = 10 * time.Second
+	transport.ResponseHeaderTimeout = 2 * time.Second
+	transport.ExpectContinueTimeout = 10 * time.Second
+	client := &http.Client{Transport: transport, Timeout: 20 * time.Second}
 	return client, nil
 }
 
