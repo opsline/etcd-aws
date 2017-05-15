@@ -143,30 +143,36 @@ func getApiResponseWithBody(privateIpAddress string, instanceId string, path str
 	var resp *http.Response
 	var err error
 	var req *http.Request
+	var apiVersion string
 
-	if bodyType == "" {
-		// health is an unversioned endpoint
-		if path == "health" {
-			req, _ = http.NewRequest(method, fmt.Sprintf("%s://%s:%s/%s",
-				clientProtocol, privateIpAddress, *etcdClientPort, path), body)
-		} else {
-			req, _ = http.NewRequest(method, fmt.Sprintf("%s://%s:%s/v2/%s",
-				clientProtocol, privateIpAddress, *etcdClientPort, path), body)
-		}
+	if path != "health" {
+		apiVersion = "/v2"
+	}
+
+	req, err = http.NewRequest(method, fmt.Sprintf("%s://%s:%s%s/%s",
+		clientProtocol, privateIpAddress, *etcdClientPort, apiVersion, path), body)
+
+	if err != nil {
+		return resp, fmt.Errorf("%s: %s %s: %s",
+			instanceId, method, req.URL, err)
+	}
+
+	if method != "GET" && method != "DELETE" && bodyType != "" {
+		req.Header.Add("Content-Type", bodyType)
 	}
 
 	client, err := getHttpClient()
 
-	if bodyType != "" {
-		client.Post(fmt.Sprintf("%s://%s:%s/v2/%s",
-			clientProtocol, privateIpAddress, *etcdClientPort, path), bodyType, body)
-	} else {
-		resp, err = client.Do(req)
+	if err != nil {
+		return resp, fmt.Errorf("%s: %s %s: %s",
+			instanceId, method, req.URL, err)
 	}
 
+	resp, err = client.Do(req)
+
 	if err != nil {
-		return nil, fmt.Errorf("%s: %s %s://%s:%s/v2/%s: %s",
-			instanceId, method, clientProtocol, privateIpAddress, *etcdClientPort, path, err)
+		return resp, fmt.Errorf("%s: %s %s: %s",
+			instanceId, method, req.URL, err)
 	}
 	return resp, nil
 }
