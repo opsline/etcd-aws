@@ -20,6 +20,19 @@ It is also available as a Docker container:
       -e ETCD_BACKUP_BUCKET=my-etcd-backups \
       --rm opsline/etcd-aws
 
+### Policy Permissions
+
+`etcd-aws` requires the following policy permissions be applied to the
+instance profile used by the autoscaling group's launch configuration:
+
+* ec2:DescribeInstances
+* autoscaling:DescribeAutoScalingGroups
+* autoscaling:DescribeLifecycleHooks
+* autoscaling:CompleteLifecycleAction
+* sqs:DeleteMessage
+* sqs:GetQueueUrl
+* sqs:ReceiveMessage
+
 # CloudFormation
 
 The program `etcd-aws-cfn` generates and deploys a CloudFormation template:

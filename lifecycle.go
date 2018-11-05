@@ -56,9 +56,14 @@ func handleLifecycleEvent(m *ec2cluster.LifecycleMessage) (shouldContinue bool, 
 func watchLifecycleEvents(s *ec2cluster.Cluster, queueName string) {
 	localInstance, _ = s.Instance()
 	for {
-		q, _ := LifecycleEventQueueURL(s, queueName)
+		q, err := LifecycleEventQueueURL(s, queueName)
+
+		if err != nil {
+			log.Fatalf("ERROR: LifecycleEventQueueURL: %s", err)
+		}
+
 		log.Printf("SQS queue URL: %s", q)
-		err := s.WatchLifecycleEvents(q, handleLifecycleEvent)
+		err = s.WatchLifecycleEvents(q, handleLifecycleEvent)
 
 		// The lifecycle hook might not exist yet if we're being created
 		// by cloudformation.
