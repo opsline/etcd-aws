@@ -55,6 +55,11 @@ type etcdMember struct {
 	ClientURLs []string `json:"clientURLs,omitempty"`
 }
 
+type etcdHealth struct {
+	Health string `json:"health"`
+}
+
+var awsSession *session.Session
 var localInstance *ec2.Instance
 var peerProtocol string
 var clientProtocol string
@@ -84,11 +89,18 @@ func getHttpClient() (*http.Client, error) {
 			RootCAs:      caCertPool,
 		}
 		tlsConfig.BuildNameToCertificate()
-		transport = &http.Transport{TLSClientConfig: tlsConfig}
+		transport = &http.Transport{
+			TLSClientConfig:     tlsConfig,
+			TLSHandshakeTimeout: 2 * time.Second,
+		}
 	} else {
 		transport = &http.Transport{}
 	}
-	client := &http.Client{Transport: transport}
+
+	transport.IdleConnTimeout = 10 * time.Second
+	transport.ResponseHeaderTimeout = 2 * time.Second
+	transport.ExpectContinueTimeout = 10 * time.Second
+	client := &http.Client{Transport: transport, Timeout: 20 * time.Second}
 	return client, nil
 }
 
@@ -131,31 +143,57 @@ func getApiResponseWithBody(privateIpAddress string, instanceId string, path str
 	var resp *http.Response
 	var err error
 	var req *http.Request
+	var apiVersion string
 
-	if bodyType == "" {
-		req, _ = http.NewRequest(method, fmt.Sprintf("%s://%s:%s/v2/%s",
-			clientProtocol, privateIpAddress, *etcdClientPort, path), body)
+	if path != "health" {
+		apiVersion = "/v2"
+	}
+
+	req, err = http.NewRequest(method, fmt.Sprintf("%s://%s:%s%s/%s",
+		clientProtocol, privateIpAddress, *etcdClientPort, apiVersion, path), body)
+
+	if err != nil {
+		return resp, fmt.Errorf("%s: %s %s: %s",
+			instanceId, method, req.URL, err)
+	}
+
+	if method != "GET" && method != "DELETE" && bodyType != "" {
+		req.Header.Add("Content-Type", bodyType)
 	}
 
 	client, err := getHttpClient()
 
-	if bodyType != "" {
-		client.Post(fmt.Sprintf("%s://%s:%s/v2/%s",
-			clientProtocol, privateIpAddress, *etcdClientPort, path), bodyType, body)
-	} else {
-		resp, err = client.Do(req)
+	if err != nil {
+		return resp, fmt.Errorf("%s: %s %s: %s",
+			instanceId, method, req.URL, err)
 	}
 
+	resp, err = client.Do(req)
+
 	if err != nil {
-		return nil, fmt.Errorf("%s: %s %s://%s:%s/v2/%s: %s",
-			instanceId, method, clientProtocol, privateIpAddress, *etcdClientPort, path, err)
+		return resp, fmt.Errorf("%s: %s %s: %s",
+			instanceId, method, req.URL, err)
 	}
 	return resp, nil
 }
 
-func buildCluster(s *ec2cluster.Cluster) (initialClusterState string, initialCluster []string, err error) {
+const ec2StateRunning int64 = 16
 
+/*
+	Determines whether local instance should attempt to:
+	* Join an existing cluster via a healthy member
+		* Members must be part of an ASG
+		* All members must have the same leader
+	* Error if an existing cluster is unhealthy
+	* Bootstrap a new cluster with instances of the local instance's ASG
+**/
+func buildCluster(s *ec2cluster.Cluster) (initialClusterState string, initialCluster []string, err error) {
 	localInstance, err := s.Instance()
+	if err != nil {
+		return "", nil, err
+	}
+
+	asg, err := s.AutoscalingGroup()
 	if err != nil {
 		return "", nil, err
 	}
@@ -165,62 +203,148 @@ func buildCluster(s *ec2cluster.Cluster) (initialClusterState string, initialClu
 		return "", nil, fmt.Errorf("list members: %s", err)
 	}
 
-	initialClusterState = "new"
-	initialCluster = []string{}
+	asgMembers := []string{}
+	existingCluster := []string{}
+	clusterLeader := ""
+	membersHaveLeader := 0
+	var healthyMember *ec2.Instance
+
 	for _, instance := range clusterInstances {
 		if instance.PrivateIpAddress == nil {
 			continue
 		}
-		log.Printf("getting stats from %s (%s)", *instance.InstanceId, *instance.PrivateIpAddress)
 
-		// add this instance to the initialCluster expression
-		initialCluster = append(initialCluster, fmt.Sprintf("%s=%s://%s:%s",
-			*instance.InstanceId, peerProtocol, *instance.PrivateIpAddress, *etcdPeerPort))
-
-		// skip the local node, since we know it is not running yet
-		if *instance.InstanceId == *localInstance.InstanceId {
+		if *instance.State.Code > ec2StateRunning {
 			continue
 		}
+
+		if *instance.InstanceId == *localInstance.InstanceId {
+			local := fmt.Sprintf("%s=%s://%s:%s",
+				*instance.InstanceId, peerProtocol, *instance.PrivateIpAddress, *etcdPeerPort)
+			asgMembers = append(asgMembers, local)
+			existingCluster = append(existingCluster, local)
+			continue
+		}
+
+		instance_in_asg := false
+
+		for _, tag := range instance.Tags {
+			if *tag.Key == "aws:autoscaling:groupName" {
+				instance_in_asg = true
+
+				if *tag.Value == *asg.AutoScalingGroupName {
+					local := fmt.Sprintf("%s=%s://%s:%s",
+						*instance.InstanceId, peerProtocol, *instance.PrivateIpAddress, *etcdPeerPort)
+					asgMembers = append(asgMembers, local)
+				}
+				break
+			}
+		}
+
+		if !instance_in_asg {
+			continue
+		}
+
+		log.Printf("getting stats from %s (%s)", *instance.InstanceId, *instance.PrivateIpAddress)
 
 		// fetch the state of the node.
 		path := "stats/self"
 		resp, err := getApiResponse(*instance.PrivateIpAddress, *instance.InstanceId, path, http.MethodGet)
 		if err != nil {
-			log.Printf("%s: %s://%s:%s/v2/%s: %s", *instance.InstanceId, clientProtocol,
-				*instance.PrivateIpAddress, *etcdClientPort, path, err)
+			log.Printf("%s: %s: %s", *instance.InstanceId, path, err)
 			continue
 		}
 		nodeState := etcdState{}
 		if err := json.NewDecoder(resp.Body).Decode(&nodeState); err != nil {
-			log.Printf("%s: %s://%s:%s/v2/%s: %s", *instance.InstanceId, clientProtocol,
-				*instance.PrivateIpAddress, *etcdClientPort, path, err)
+			log.Printf("%s: %s: %s", *instance.InstanceId, resp.Request.URL, err)
 			continue
 		}
 
 		if nodeState.LeaderInfo.Leader == "" {
-			log.Printf("%s: %s://%s:%s/v2/%s: alive, no leader", *instance.InstanceId, clientProtocol,
-				*instance.PrivateIpAddress, *etcdClientPort, path)
+			log.Printf("%s: %s: alive, no leader", *instance.InstanceId, resp.Request.URL)
 			continue
 		}
 
-		log.Printf("%s: %s://%s:%s/v2/%s: has leader %s", *instance.InstanceId, clientProtocol,
-			*instance.PrivateIpAddress, *etcdClientPort, path, nodeState.LeaderInfo.Leader)
-		if initialClusterState != "existing" {
-			initialClusterState = "existing"
+		membersHaveLeader += 1
 
-			// inform the node we found about the new node we're about to add so that
-			// when etcd starts we can avoid etcd thinking the cluster is out of sync.
-			log.Printf("joining cluster via %s", *instance.InstanceId)
-			m := etcdMember{
-				Name: *localInstance.InstanceId,
-				PeerURLs: []string{fmt.Sprintf("%s://%s:%s",
-					peerProtocol, *localInstance.PrivateIpAddress, *etcdPeerPort)},
+		if clusterLeader == "" {
+			clusterLeader = nodeState.LeaderInfo.Leader
+		}
+
+		log.Printf("%s: %s: has leader %s", *instance.InstanceId,
+			resp.Request.URL, nodeState.LeaderInfo.Leader)
+
+		if nodeState.LeaderInfo.Leader != clusterLeader {
+			return "", nil, fmt.Errorf("unhealthy cluster: nodes reporting different leaders")
+		}
+
+		local := fmt.Sprintf("%s=%s://%s:%s",
+			*instance.InstanceId, peerProtocol, *instance.PrivateIpAddress, *etcdPeerPort)
+		existingCluster = append(existingCluster, local)
+
+		if healthyMember == nil {
+			resp, err := getApiResponse(*instance.PrivateIpAddress, *localInstance.InstanceId, "health", http.MethodGet)
+			if err != nil {
+				continue
 			}
-			body, _ := json.Marshal(m)
-			getApiResponseWithBody(*instance.PrivateIpAddress, *instance.InstanceId, "members", http.MethodPost, "application/json", bytes.NewReader(body))
+
+			health := etcdHealth{}
+			if err = json.NewDecoder(resp.Body).Decode(&health); err != nil {
+				continue
+			}
+
+			if health.Health == "true" {
+				resp, err = getApiResponse(*instance.PrivateIpAddress, *instance.InstanceId, "members", http.MethodGet)
+				if err != nil {
+					continue
+				}
+				defer resp.Body.Close()
+				members := etcdMembers{}
+				if err := json.NewDecoder(resp.Body).Decode(&members); err != nil {
+					continue
+				}
+
+				alreadyMember := false
+				for _, member := range members.Members {
+					if member.Name == *localInstance.InstanceId {
+						alreadyMember = true
+						break
+					}
+				}
+				if !alreadyMember {
+					healthyMember = instance
+				}
+			}
 		}
 	}
-	return initialClusterState, initialCluster, nil
+
+	if membersHaveLeader == 0 || healthyMember == nil {
+		return "new", asgMembers, nil
+	}
+
+	// inform the node we found about the new node we're about to add so that
+	// when etcd starts we can avoid etcd thinking the cluster is out of sync.
+	log.Printf("joining cluster via %s", *healthyMember.InstanceId)
+	m := etcdMember{
+		Name: *localInstance.InstanceId,
+		PeerURLs: []string{fmt.Sprintf("%s://%s:%s",
+			peerProtocol, *localInstance.PrivateIpAddress, *etcdPeerPort)},
+	}
+	body, _ := json.Marshal(m)
+
+	resp, err := getApiResponseWithBody(*healthyMember.PrivateIpAddress, *healthyMember.InstanceId, "members", http.MethodPost, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return "", nil, fmt.Errorf("%s: joining cluster failed: %s", m.PeerURLs[0], err)
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		body, _ = ioutil.ReadAll(resp.Body)
+		return "", nil, fmt.Errorf("%s: received %d status: %s", m.PeerURLs[0], resp.StatusCode, string(body))
+	}
+
+	return "existing", existingCluster, nil
 }
 
 func main() {
@@ -342,7 +466,7 @@ func main() {
 		}
 	}
 
-	awsSession := session.New()
+	awsSession = session.New()
 	if region := os.Getenv("AWS_REGION"); region != "" {
 		awsSession.Config.WithRegion(region)
 	}
@@ -360,6 +484,9 @@ func main() {
 	}
 
 	initialClusterState, initialCluster, err := buildCluster(s)
+	if err != nil {
+		log.Fatalf("ERROR: %s", err)
+	}
 	log.Printf("initial cluster: %s %s", initialClusterState, initialCluster)
 
 	// start the backup and restore goroutine.
